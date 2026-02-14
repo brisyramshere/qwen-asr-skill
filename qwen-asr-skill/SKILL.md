@@ -14,13 +14,13 @@ Install dependencies into a Python 3.10+ virtual environment:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install qwen-asr soundfile
+pip install qwen-asr soundfile silero-vad
 ```
 
 For GPUs with compute capability < 7.0 (e.g. GTX 1060), install PyTorch 2.4.x with CUDA 11.8:
 
 ```bash
-pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118
 ```
 
 ## Usage
@@ -39,6 +39,7 @@ python scripts/transcribe.py <audio_path>
 | `--language` | Force language (e.g. Chinese, English). Auto-detect if omitted | Auto-detect |
 | `--device` | Inference device: auto / cuda / cpu | auto |
 | `--model-path` | Model path or HuggingFace ID | ~/models/Qwen3-ASR-1.7B |
+| `--max-chunk-sec` | Max chunk duration for VAD splitting. Long audio is split at silence boundaries | 90 |
 | `--max-new-tokens` | Max tokens to generate. Increase for long audio | 2048 |
 
 ### Examples
@@ -78,3 +79,4 @@ On error:
 - Supports: WAV, MP3, FLAC, M4A, OGG and other common audio formats
 - 52 languages including Chinese, English, Japanese, Korean, French, German, etc.
 - 22 Chinese dialects supported
+- **Long audio**: Audio longer than 90s is automatically split at silence boundaries using silero-vad, transcribed chunk by chunk, then concatenated. This prevents OOM on limited VRAM GPUs.

@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 
 DEFAULT_MODEL = os.environ.get(
@@ -97,19 +98,97 @@ def load_model(model_path: str, device: str, max_new_tokens: int):
         return model
 
 
-def transcribe(model, audio_path: str, language: str | None) -> dict:
-    """Run transcription and return result dict."""
-    lang_arg = language if language else None
+def vad_split(audio_path: str, max_chunk_sec: float = 90) -> list[str]:
+    """Split long audio at silence boundaries using VAD. Returns list of file paths."""
+    import torch
+    import torchaudio
+    from silero_vad import load_silero_vad, get_speech_timestamps
+    import soundfile as sf
 
-    results = model.transcribe(
-        audio=audio_path,
-        language=lang_arg,
+    wav, sr = torchaudio.load(audio_path)
+
+    # Convert to 16kHz mono
+    if sr != 16000:
+        wav = torchaudio.functional.resample(wav, sr, 16000)
+        sr = 16000
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0)
+    else:
+        wav = wav.squeeze(0)
+
+    duration = wav.shape[0] / sr
+    if duration <= max_chunk_sec:
+        return [audio_path]
+
+    print(f"INFO: Audio is {duration:.1f}s, splitting with VAD (max {max_chunk_sec}s per chunk)", file=sys.stderr)
+
+    vad_model = load_silero_vad()
+    speech_ts = get_speech_timestamps(
+        wav, vad_model,
+        sampling_rate=16000,
+        min_silence_duration_ms=300,
+        speech_pad_ms=200,
+        return_seconds=False,
     )
 
-    r = results[0]
+    if not speech_ts:
+        print("WARN: VAD detected no speech, falling back to whole file", file=sys.stderr)
+        return [audio_path]
+
+    # Merge adjacent segments up to max_chunk_sec
+    chunks = []
+    current_start = speech_ts[0]['start']
+    current_end = speech_ts[0]['end']
+
+    for seg in speech_ts[1:]:
+        merged_duration = (seg['end'] - current_start) / sr
+        if merged_duration > max_chunk_sec:
+            chunks.append((current_start, current_end))
+            current_start = seg['start']
+        current_end = seg['end']
+    chunks.append((current_start, current_end))
+
+    print(f"INFO: Split into {len(chunks)} chunks", file=sys.stderr)
+
+    # Save each chunk as a temp wav file
+    tmp_paths = []
+    for i, (start, end) in enumerate(chunks):
+        chunk_wav = wav[start:end].numpy()
+        chunk_duration = (end - start) / sr
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        sf.write(tmp.name, chunk_wav, 16000)
+        tmp_paths.append(tmp.name)
+        print(f"INFO: Chunk {i+1}/{len(chunks)}: {chunk_duration:.1f}s", file=sys.stderr)
+
+    return tmp_paths
+
+
+def transcribe(model, audio_path: str, language: str | None, max_chunk_sec: float) -> dict:
+    """Run transcription, with VAD chunking for long audio."""
+    chunks = vad_split(audio_path, max_chunk_sec)
+
+    texts = []
+    detected_lang = None
+    for i, chunk_path in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"INFO: Transcribing chunk {i+1}/{len(chunks)}...", file=sys.stderr)
+        results = model.transcribe(audio=chunk_path, language=language)
+        r = results[0]
+        texts.append(r.text)
+        if detected_lang is None:
+            detected_lang = r.language
+
+    # Clean up temp files
+    for p in chunks:
+        if p != audio_path:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
     return {
-        "language": r.language,
-        "text": r.text,
+        "language": detected_lang,
+        "text": "".join(texts),
     }
 
 
@@ -143,6 +222,12 @@ def main():
         default=2048,
         help="Max tokens to generate. Increase for very long audio (default: 2048)",
     )
+    parser.add_argument(
+        "--max-chunk-sec",
+        type=float,
+        default=90,
+        help="Max chunk duration in seconds for VAD splitting. Long audio is split at silence boundaries (default: 90)",
+    )
 
     args = parser.parse_args()
 
@@ -159,7 +244,7 @@ def main():
     print(f"INFO: Model loaded in {load_time:.1f}s", file=sys.stderr)
 
     t1 = time.time()
-    result = transcribe(model, args.audio_path, args.language)
+    result = transcribe(model, args.audio_path, args.language, args.max_chunk_sec)
     infer_time = time.time() - t1
     print(f"INFO: Transcription completed in {infer_time:.1f}s", file=sys.stderr)
 
